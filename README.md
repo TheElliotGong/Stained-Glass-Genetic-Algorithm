@@ -1,183 +1,82 @@
 # Stained Glass Genetic Art
 
-[![tests](https://github.com/TheElliotGong/Genetic-Art-Algorithm-part-2/actions/workflows/tests.yml/badge.svg)](https://github.com/TheElliotGong/Genetic-Art-Algorithm-part-2/actions/workflows/tests.yml)
+[![tests](https://github.com/TheElliotGong/Stained-Glass-Genetic-Algorithm/actions/workflows/tests.yml/badge.svg)](https://github.com/TheElliotGong/Stained-Glass-Genetic-Algorithm/actions/workflows/tests.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Evolves a stained-glass style painting toward any target image using a genetic
-algorithm over a Voronoi diagram, and serves the whole thing as a REST-backed
-web application with live progress streaming.
+A genetic algorithm that evolves a stained-glass painting, a Voronoi diagram of
+colored cells, toward any target image.
+
+This project is a fork of Sebastian Proost's
+[Genetic-Art-Algorithm-part-2](https://github.com/4dcu-be/Genetic-Art-Algorithm-part-2).
+His idea and his evolutionary schedule are the foundation. The original is a
+single script that took days to run 5,000 generations. This fork keeps the idea
+and makes it **faster, more accurate and fully customizable**, and wraps it in a
+web app so anyone can run it on their own image.
 
 ![Evolution of a painting toward the target image](vermeer_evolution.png)
 
-*A population evolving toward Vermeer's* Girl with a Pearl Earring. *Each frame
-is the best individual at that point in the run.*
+*A population evolving toward Vermeer's* Girl with a Pearl Earring *(image from
+the original project's run).*
 
 ---
 
-## At a glance
+## What this fork changes
 
-| | |
-| --- | --- |
-| **Core** | Genetic algorithm over a Voronoi tessellation, written in Python |
-| **Architecture** | Client/server web application - REST API + Server-Sent Events, vanilla-JS front end |
-| **Performance** | **9.7x end-to-end speedup**, proven output-identical by a dedicated equivalence test suite |
-| **Testing** | **288 automated tests**, running on 3 operating systems x 2 Python versions in CI |
-| **Scale** | ~2,750 lines of application code across 10 modules, backed by ~2,860 lines of tests |
-
-This started as a fork of Sebastian Proost's Voronoi genetic art algorithm. The
-work that followed - image pre-processing, cell outlining, a divide-and-conquer
-tiled solver, a full profiling-and-optimization pass, the web application, and
-the test suite - is documented below.
-
----
-
-## Architecture
-
-The project is layered so the algorithm never depends on the web tier, which
-keeps it usable from the command line and testable without a running server.
-
-```
-Browser (HTML5 / CSS / vanilla JS)
-        |  REST + Server-Sent Events
-webapp/app.py        - 18 HTTP endpoints, request validation, streaming
-webapp/params.py     - typed parameter model, the single validation authority
-webapp/runner.py     - job queue, worker thread, progress + lifecycle
-webapp/imaging.py    - decoding, EXIF handling, SSRF-guarded URL fetch
-        |  plain function calls
-evolve_voronoi.py    - whole-image solver, seeding, palette, selection
-evolve_tiled.py      - divide-and-conquer tiled solver
-voronoi_painting.py  - the genome: VoronoiPainting / ColoredPoint
-target_cache.py      - process-global content-addressed image registry
-```
-
-### Object-oriented design
-
-The genome is a small, deliberately-designed class hierarchy, because it is
-copied and serialized millions of times per run - every design decision here
-shows up directly in the profiler.
-
-**`ColoredPoint`** ([voronoi_painting.py:45](voronoi_painting.py:45)) - one
-Voronoi cell: a coordinate and an RGBA color. It declares `__slots__` to drop
-the per-instance `__dict__`, which matters because a single population holds
-hundreds of thousands of these. It implements `__getstate__` / `__setstate__`
-so `__slots__` and pickling coexist.
-
-**`VoronoiPainting`** ([voronoi_painting.py:111](voronoi_painting.py:111)) - one
-candidate solution. It encapsulates its point list behind read-only `@property`
-accessors and exposes the genetic operators as `@staticmethod` factories
-(`breed`, `mate`, `merge`). Its notable feature is a custom serialization
-contract: `__getstate__` converts the genome into two flat NumPy arrays rather
-than letting the serializer walk thousands of Python objects, and
-`__setstate__` rebuilds them on arrival.
-
-**`Job` and `JobManager`** ([webapp/runner.py:148](webapp/runner.py:148)) -
-`Job` is a state machine (`queued -> running -> done | error | cancelled`)
-holding progress, history and cancellation state behind a lock. `JobManager`
-owns the queue, the worker thread, and eviction of old runs.
-
-**`RunParams`** ([webapp/params.py:13](webapp/params.py:13)) - a Pydantic model
-that is simultaneously the API request schema, the validation layer, and the
-description the front end builds its controls from. Derived values
-(`survivor_count`, `total_generations`, `phase_plan`) are computed properties,
-so the progress bar and the solver can never disagree about what a run means.
-
-Design patterns applied where they earned their place:
-
-| Pattern | Where | Why |
+| | Original | This fork |
 | --- | --- | --- |
-| **Object pool** | `_render_buffers` ([voronoi_painting.py:22](voronoi_painting.py:22)) | Rendering needs 4 scratch arrays; pooling them by shape removed a per-render allocation of 12 bytes per output pixel |
-| **Flyweight / identity map** | [target_cache.py](target_cache.py) | One shared copy of the target image per process, keyed by content hash, instead of one per individual |
-| **Prototype** | `__deepcopy__` ([voronoi_painting.py:202](voronoi_painting.py:202)) | Clones the genome and *shares* the immutable target - a 48x faster copy |
-| **Strategy** | `parent_picker` / `combiner` ([evolve_voronoi.py:397](evolve_voronoi.py:397)) | Selection (`pick_best`, `pick_random`, `pick_best_and_random`) and recombination (`mate`, `merge`) are swapped per evolution phase |
-| **Producer/consumer** | `JobManager` ([webapp/runner.py:316](webapp/runner.py:316)) | HTTP threads enqueue; one worker thread executes, so a long run never blocks the API |
+| **Rendering** | A `scipy` Voronoi diagram, with each cell drawn as a PIL polygon and alpha-composited over the whole canvas | One OpenCV distance transform labels every pixel with its nearest seed. **~6x faster at 100 points, ~23x at 800**, and nearly flat as the point count grows |
+| **Evolution loop** | Full target image copied and serialized with every individual, every generation | Targets are shared, genomes are packed into flat arrays, buffers are reused. **~8-10x faster end to end**, with output proven identical |
+| **Coverage** | Unbounded border cells were skipped, leaving background holes | Every pixel belongs to a cell |
+| **Starting population** | Random points and random colors | Seeded from the target's own colors, edges, texture and regions |
+| **Large images** | One population for the whole image | Optional tiled solver: independent tiles, feather-blended without seams |
+| **Look** | Flat colored cells | Stained-glass outlines with configurable color and width, plus supersampled output |
+| **Configuration** | Constants edited inside `__main__` | 21 validated parameters, from the web UI, the API or the scripts |
+| **Interface** | Run a script, wait for PNGs | Web app with upload, live preview, progress and ETA, cancel and download |
+| **Confidence** | None | 288 tests, an equivalence suite pinning the optimized code to the pre-optimization code, a benchmark harness, and CI on 3 operating systems x 2 Python versions |
 
-### Data structures and algorithms
-
-**Voronoi assignment via distance transform.** The naive way to color a Voronoi
-diagram is, for every pixel, to scan every seed - `O(width x height x points)`.
-Instead, seeds are written into a binary image and a single distance transform
-labels every pixel with its nearest seed in `O(width x height)`, independent of
-the point count ([voronoi_painting.py:254](voronoi_painting.py:254)). At 200
-points that removes two orders of magnitude of work from the innermost loop of
-the entire program.
-
-**Color lookup table.** Labels are turned into pixels through a LUT indexed by
-label, written into a preallocated buffer with `np.take`. That is `O(1)` per
-pixel with no per-pixel branching, and it replaced fancy indexing that
-allocated a fresh result array on every one of the millions of renders per run.
-
-**Region-seeded initialization.** Rather than scattering starting points
-uniformly, the target is segmented first: a palette is extracted and condensed,
-pixels are mapped to it, Canny edges and a Laplacian texture measure split those
-into regions, and connected-component labeling groups them
-([evolve_voronoi.py:173](evolve_voronoi.py:173)). Points are then seeded inside
-detected regions with probability `region_bias`. `tests/test_evolve_voronoi.py`
-asserts this beats uniform random seeding rather than assuming it.
-
-**Palette reduction.** `condense_palette` greedily filters colors below a
-Euclidean distance threshold in RGB space; `simplify_palette` then strides
-uniformly to hit an exact target count; `map_pixels_to_palette` assigns every
-pixel via a vectorized broadcast-and-`argmin` nearest-neighbor search
-([evolve_voronoi.py:131](evolve_voronoi.py:131)).
-
-**Divide and conquer.** [evolve_tiled.py](evolve_tiled.py) partitions the image
-into an `n_rows x n_cols` grid, evolves each tile as an independent population,
-then feather-blends overlapping borders so no seam is visible. Smaller
-subproblems converge faster and use less memory than one global population.
-`tests/test_evolve_tiled.py` verifies the grid covers every pixel exactly once
-and that stitching uniform tiles leaves no visible seam.
-
-**Content-addressed cache.** [target_cache.py](target_cache.py) keys target
-images by a hash of their pixels, so identical images collapse to one entry, and
-spools them to disk so `spawn`-based worker processes (the default on Windows)
-can rehydrate without the image crossing the wire.
-
-**Complexity fix in mutation.** `mutate_points` samples the `k` indices it needs
-in `O(k)` instead of shuffling all `n` and taking a prefix - at a 3% mutation
-rate the shuffle dominated
-([voronoi_painting.py:213](voronoi_painting.py:213)).
+The sections below cover each change in turn.
 
 ---
 
-## Web interface
+## 1. Speed
 
-```bash
-python run_web.py
-```
+### A renderer that no longer scales with the point count
 
-Then open <http://127.0.0.1:8000>. Pass `--host` / `--port` to change where it
-binds, e.g. `python run_web.py --host 0.0.0.0 --port 8080` to reach it from
-another machine on your network.
+Every individual in every generation has to be rendered before it can be
+scored, so the renderer is the innermost loop of the whole program. The original
+built a Voronoi diagram with `scipy`, drew each cell as a PIL polygon onto a
+full-size RGBA layer, and alpha-composited that layer onto the canvas. That is
+one full-image composite per cell.
 
-The API is a REST service over JSON; the browser client is dependency-free
-HTML5, CSS and JavaScript.
+The replacement ([voronoi_painting.py](voronoi_painting.py)) writes the seeds
+into a binary image and runs a single `cv2.distanceTransformWithLabels`, which
+labels every pixel with its nearest seed in `O(width x height)` regardless of
+how many seeds there are. A color lookup table turns labels into pixels with one
+`np.take`.
 
-| Concern | Implementation |
-| --- | --- |
-| Target selection | Multipart upload, server-side URL fetch, or bundled samples |
-| Validation | One Pydantic model serves as request schema, bounds check, and the source the UI builds its sliders from |
-| Live progress | Server-Sent Events (`/api/jobs/{id}/events`) push generation, similarity, ETA and point count without polling |
-| Live preview | Best individual re-rendered every *N* generations, with a wipe slider against the target |
-| Concurrency | Runs execute one at a time on a background worker thread; queued requests are told their position |
-| Cancellation | Cooperative, via a per-job `threading.Event` checked in the evolution loop |
-| Security | URL fetches are refused when the hostname resolves to a private, loopback or link-local address (SSRF guard) |
+Time to score one individual (render plus compare), original against current, on
+a 400x469 target:
 
-Interactive API documentation is generated at `/docs`. Output is written to
-`runs/` (override with `VORONOI_WEB_DATA`).
+| points | original | current | speedup |
+| --- | --- | --- | --- |
+| 100 | 15.0 ms | 2.4 ms | ~6x |
+| 250 | 38.2 ms | 3.3 ms | ~12x |
+| 800 | 111.9 ms | 4.8 ms | ~23x |
 
----
+The original's cost grows with the point count, and the new renderer's barely
+does. That matters because the original schedule spends most of its 5,000
+generations at 500 to 800 points.
 
-## Performance engineering
+*(Measured on one 2-core Linux machine, upstream commit `9fd359f` against the
+current code. Absolute numbers will differ on your hardware.)*
 
-The evolution loop was profiled and optimized **without changing what it
-produces**. For a given genome, the renderer, the outlined renderer and the
-fitness score are byte-identical to the original implementation - and
-`tests/test_equivalence.py` asserts exactly that against a verbatim copy of the
-pre-optimization code kept in `tests/reference_impl.py`.
+### A profiled pass over the evolution loop
 
-Measured on `img/girl_with_pearl_earring_half.jpg` (400x469), 250 points,
-population 60, on a 2 core machine:
+With the renderer fixed, the loop was profiled and the remaining time was
+mostly overhead around the work, not the work itself. Measured on
+`img/girl_with_pearl_earring_half.jpg` (400x469), 250 points, population 60,
+2 cores:
 
 | operation | before | after | speedup |
 | --- | --- | --- | --- |
@@ -188,25 +87,51 @@ population 60, on a 2 core machine:
 | serialized size per individual | 1290.8 KiB | 3.4 KiB | **384x** |
 | **end to end** | **1.0 gen/s** | **9.7 gen/s** | **9.7x** |
 
-Where the time was going:
+An independent re-run on a different 2-core machine gave 8.2x end to end with
+the same 384x payload reduction, so expect roughly 8-10x depending on hardware.
+
+What was wrong, and what fixed it:
 
 - **The target image was stored on every painting.** `evol` serializes whole
-  individuals on each `evaluate`, so a 250 individual population shipped the
-  target image 250 times per generation, and every `deepcopy` in the mutation
-  and crossover operators duplicated it again. Targets now live in a
-  per-process registry ([target_cache.py](target_cache.py)) and paintings carry
-  only a short content key.
-- **The genome was serialized as objects.** `evol` serializes with `dill`,
-  which dispatches per object; paintings now transport their points as two
-  NumPy arrays and rebuild them on arrival.
-- **Rendering reallocated four full-size arrays per call.** They are now pooled
-  per process and reused, and the color lookup writes into a preallocated
-  buffer.
-- **Operators copied more than they needed to.** Crossover and merge hand back
-  children that already own their points, so the extra `deepcopy` is gone, and
-  mutation samples the indices it needs instead of shuffling all of them.
+  individuals on each evaluation, so a 250-individual population shipped the
+  target 250 times per generation, and every `deepcopy` in the genetic operators
+  duplicated it again. Targets now live in a per-process, content-addressed
+  registry ([target_cache.py](target_cache.py)) and paintings carry a short key.
+- **The genome was serialized as thousands of Python objects.** Paintings now
+  transport their points as two flat NumPy arrays and rebuild them on arrival.
+- **Rendering reallocated four full-size arrays on every call.** They are now
+  pooled per process and reused, and the color lookup writes into a
+  preallocated buffer.
+- **The operators copied more than they needed to.** Crossover and merge return
+  children that already own their points, so the extra `deepcopy` is gone.
+  Points use `__slots__` and a cheap `copy()`. Mutation samples the `k` indices
+  it needs in `O(k)` instead of shuffling all `n`.
+- **The loop did needless I/O.** The original rendered and saved a 3x PNG every
+  generation and printed a progress dot per evaluation. Previews are now saved
+  every 10 generations, and the dots are opt-in (`VORONOI_PROGRESS=1`).
 
-### Benchmarking
+### Divide and conquer for big images
+
+[evolve_tiled.py](evolve_tiled.py) splits the image into a grid, evolves each
+tile as its own small population, and blends the results back together. Smaller
+subproblems converge faster, use less memory, and are easy to parallelize. See
+[Accuracy](#2-accuracy-and-quality) for how the seams are hidden.
+
+### Optimized, but provably not changed
+
+Speedups that quietly change the output make it impossible to tell an
+optimization from a regression in art quality, so this fork treats
+"identical output" as a requirement, not a hope. For a given genome, the
+renderer, the outlined renderer and the fitness score are byte-identical to the
+pre-optimization implementation.
+[tests/test_equivalence.py](tests/test_equivalence.py) asserts exactly that
+against a verbatim copy of the old code in
+[tests/reference_impl.py](tests/reference_impl.py).
+
+### Measure it yourself
+
+[benchmark.py](benchmark.py) times each hot path and the end-to-end loop, and
+can save and compare runs, so any speedup claim can be checked on your machine:
 
 ```bash
 python benchmark.py --image ./img/car.jpeg --label after --save-json bench_after.json
@@ -215,17 +140,199 @@ python benchmark.py --sweep-workers 1,2,4,8              # find the best worker 
 pytest tests/test_equivalence.py                         # confirm output is unchanged
 ```
 
-Run the worker sweep on your own machine before picking `concurrent_workers` /
-`workers`. Now that individuals are small on the wire, worker processes only pay
-off once the per-individual rendering work exceeds the cost of moving
-individuals between processes - for small tiles a lower worker count can be
-faster than a higher one.
+Run the worker sweep before choosing `workers`. Now that individuals are small
+on the wire, extra processes only pay off once rendering outweighs the cost of
+moving individuals between them, so for small images a lower worker count can
+be faster.
 
 ---
 
-## Testing
+## 2. Accuracy and quality
 
-288 tests across 10 files, running in under 5 seconds with no network access, no
+### Every pixel is covered
+
+The original only painted bounded Voronoi cells, so the cells along the border
+were skipped and showed the background color. The distance-transform renderer
+assigns every pixel to its nearest seed, so the canvas is always fully covered
+and the fitness score is never penalizing a hole that no mutation could fix.
+
+### A smarter starting population
+
+The original starts from random points with random colors, so early generations
+are spent discovering the basic layout and palette of the picture. Here the
+target is analyzed first ([evolve_voronoi.py](evolve_voronoi.py)):
+
+1. **Palette extraction.** An adaptive palette is pulled from the target, then
+   `condense_palette` drops near-duplicates and `simplify_palette` reduces it to
+   an exact color count.
+2. **Edges and texture.** Canny edges mark boundaries, and a blurred Laplacian,
+   quantized into bins, measures local texture.
+3. **Regions.** Every pixel is mapped to its nearest palette color. Pixels are
+   grouped by color and texture, edge pixels are excluded, and connected
+   components become regions with a median color.
+4. **Seeding.** Each starting point lands inside a region with probability
+   `region_bias`, chosen in proportion to region area, with a little color
+   jitter for diversity. The rest fall back to random positions and palette
+   colors.
+
+The tests assert that region-seeded populations beat uniform random seeding
+rather than assuming they do.
+
+### Seamless tiling
+
+Independent tiles would show visible grid lines. Tiles therefore overlap
+(32 px by default) and are stitched with a feathered weight mask that stays at
+full strength across each tile's core and fades only across the overlap.
+Outer image borders stay fully opaque so the canvas edges are not darkened.
+`tests/test_evolve_tiled.py` verifies that the grid covers every pixel exactly
+once and that stitching uniform tiles leaves no seam.
+
+### Correct colors
+
+The original generated random channels with `randint(0, 256)`. That bound is
+inclusive, so a channel could be 256, which does not fit in 8 bits. Colors are
+now generated in 0-255, and mutation clamps to the same range.
+
+### Evolution that can grow and shrink
+
+The original's most interesting idea is kept: *genome duplication* merges two
+parents so the point count doubles, and *shrink* steps remove points again. The
+whole-image script still runs the inherited 5,000-generation schedule
+(250 points, duplicated to 500, duplicated again to 800, with shrink steps
+between). The tiled script and the web app use a shorter three-phase plan:
+explore, duplicate once, then refine with gentler mutation.
+
+---
+
+## 3. Customization
+
+### Stained-glass look
+
+- **Outlines** between cells, with configurable color (`#rrggbb` or `#rgb`) and
+  width.
+- **Supersampled output.** The final image can be rendered at up to 8x the
+  evolution resolution, so a small, fast evolution still yields a crisp image.
+
+### Everything is a parameter
+
+In the original every setting was a constant inside `__main__`. Now
+[webapp/params.py](webapp/params.py) defines one typed model with a bound and a
+description for every setting. That one model is the request schema, the
+validator, and the source the web UI builds its sliders from.
+
+| group | parameters (default) |
+| --- | --- |
+| **Mode** | `mode` (`single`), `tiled` |
+| **Evolution** | `generations` (600), `population_size` (60), `num_points` (200), `mutation_rate` (0.05), `mutation_sigma` (0.5), `survive_fraction` (0.025), `genome_duplication` (on) |
+| **Seeding** | `region_bias` (0.85), `initial_colors` (60), `final_colors` (20) |
+| **Target** | `max_dimension` (400), the main speed dial, since runtime grows with pixel count |
+| **Tiling** | `tile_rows` (3), `tile_cols` (3), `tile_overlap` (32 px) |
+| **Output** | `outline` (on), `outline_width` (1), `outline_color` (`#000000`), `render_scale` (3) |
+| **Execution** | `workers` (1), `preview_every` (10) |
+
+### A web app instead of a script
+
+```bash
+python run_web.py
+```
+
+Then open <http://127.0.0.1:8000>. Use `--host` and `--port` to change where it
+binds, e.g. `python run_web.py --host 0.0.0.0 --port 8080`.
+
+- **Bring any image:** upload a file, give a URL, or pick a bundled sample.
+- **Watch it evolve:** generation, similarity, ETA and point count stream live
+  over Server-Sent Events, with a preview you can wipe against the target.
+- **Stay in control:** cancel a run at any time, queue several, and download the
+  finished PNG. Runs are kept in a history list.
+- **Safe to expose:** URL fetches that resolve to private, loopback or
+  link-local addresses are refused (an SSRF guard), uploads are size-capped, and
+  EXIF rotation is respected.
+
+The REST API (18 endpoints, interactive docs at `/docs`) is what the page
+itself uses, so everything in the UI can be scripted. Output is written to
+`runs/` (override with `VORONOI_WEB_DATA`).
+
+### Command-line scripts
+
+```bash
+python evolve_tiled.py    # divide-and-conquer tiled approach. Recommended for large images.
+python evolve_voronoi.py  # whole-image approach, with the original 5,000-generation schedule.
+```
+
+Paths and hyperparameters are set in each script's `__main__` block:
+
+| | `evolve_voronoi.py` | `evolve_tiled.py` |
+| --- | --- | --- |
+| Target | `./img/car.jpeg` | `./img/girl_with_pearl_earring.jpg` |
+| Output | `./output/<timestamp>/` | `./output/girl/tiled-<timestamp>/` |
+| Points | `num_points = 250` | `points_initial = 50` per tile, doubled by duplication |
+| Population | `population_size = 250` | `population_size = 100` per tile |
+| Workers | `concurrent_workers = 4` | `workers = 1` |
+| Palette | `initialColorCount = 60`, `finalColorCount = 20` | 30 colors condensed to 12 per tile |
+| Seeding | `region_bias = 0.85` | `region_bias = 0.85`, `min_area = 10` |
+| Grid | n/a | `n_rows, n_cols = 3, 3`, 32 px overlap |
+| Phases | Inherited 5,000-generation schedule | `gens_phase1 = 999`, `gens_phase2 = 1000` |
+
+Operators in both: survivors `0.025`, mutation rate `0.05` falling to `0.03`
+(sigma `0.5` to `0.4`), `mate` for crossover and `merge` for duplication.
+
+### Environment variables
+
+- `VORONOI_PROGRESS=1`: bring back the per-evaluation progress dots (off by
+  default; they cost a flushed write per individual per generation).
+- `VORONOI_TARGET_CACHE=<dir>`: where target pixels are spooled so worker
+  processes started with `spawn` (the default on Windows) can load them.
+  Defaults to a `voronoi-targets` folder in the system temp directory.
+- `VORONOI_EMBED_TARGET=1`: skip the spool file and embed target pixels in every
+  serialized painting. Slower, but makes population checkpoints self-contained
+  and loadable on another machine.
+- `VORONOI_WEB_DATA=<dir>`: where the web interface stores uploads and run
+  output. Defaults to `runs/` next to the code.
+- `VORONOI_ALLOW_PRIVATE_URLS=1`: allow "from URL" fetches that resolve to
+  private addresses. Blocked by default, because the server fetches whatever URL
+  it is handed. Only enable it if you trust everyone who can reach the app.
+
+---
+
+## 4. Engineering behind it
+
+The algorithm never depends on the web tier, so it stays usable from the command
+line and testable without a server.
+
+```
+Browser (HTML5 / CSS / vanilla JS)
+        |  REST + Server-Sent Events
+webapp/app.py        - HTTP endpoints, request validation, streaming
+webapp/params.py     - typed parameter model, the single validation authority
+webapp/runner.py     - job queue, worker thread, progress and lifecycle
+webapp/imaging.py    - decoding, EXIF handling, SSRF-guarded URL fetch
+        |  plain function calls
+evolve_voronoi.py    - whole-image solver, seeding, palette, selection
+evolve_tiled.py      - divide-and-conquer tiled solver
+voronoi_painting.py  - the genome: VoronoiPainting / ColoredPoint
+target_cache.py      - process-global content-addressed image registry
+```
+
+Design choices that earn their place, mostly because they show up directly in
+the profiler:
+
+| Pattern | Where | Why |
+| --- | --- | --- |
+| **Object pool** | render scratch buffers | Removes a per-render allocation of about 12 bytes per output pixel |
+| **Flyweight / identity map** | [target_cache.py](target_cache.py) | One shared copy of the target per process, keyed by a hash of its pixels |
+| **Prototype** | `VoronoiPainting.__deepcopy__` | Clones the genome and shares the immutable target, which is 48x faster |
+| **Strategy** | `parent_picker` / `combiner` | Selection and recombination are swapped per evolution phase |
+| **Producer/consumer** | `JobManager` | HTTP threads enqueue, one worker executes, so a long run never blocks the API |
+
+A run is a small state machine (`queued -> running -> done | error | cancelled`)
+and cancellation is cooperative, via a per-job `threading.Event` checked in the
+evolution loop.
+
+---
+
+## 5. Testing and CI
+
+288 tests across 10 files, running in about 5 seconds with no network access, no
 GPU and no long evolution runs.
 
 ```bash
@@ -235,60 +342,43 @@ pytest
 
 | file | what it pins down |
 | --- | --- |
-| `tests/test_equivalence.py` | The optimized renderer, outliner, fitness, genome copying and pickling produce byte-identical results to the pre-optimization code, kept verbatim in `tests/reference_impl.py` |
-| `tests/test_voronoi_painting.py` | Point and painting behaviour: colour clamping, mutation rates, crossover, merge, render scaling, the shared scratch buffers |
+| `tests/test_equivalence.py` | The optimized renderer, outliner, fitness, copying and pickling match the pre-optimization code byte for byte |
+| `tests/test_voronoi_painting.py` | Color clamping, mutation rates, crossover, merge, render scaling, the shared scratch buffers |
 | `tests/test_target_cache.py` | Content keying, spooling, rehydration in a *separate process*, and that a serialized individual carries no target pixels |
-| `tests/test_evolve_voronoi.py` | Palette condensing, region detection, region-seeded initialization (including that it beats uniform random seeding), parent pickers, and a short real evolution that has to improve fitness |
-| `tests/test_evolve_tiled.py` | Tile grids cover the image exactly once, feather masks stay opaque over tile cores, stitching uniform tiles leaves no visible seam |
-| `tests/test_params.py` | Every hyperparameter bound, the outline-colour parser, and the phase plan / survivor-count arithmetic the progress bar depends on |
-| `tests/test_imaging.py` | Decoding, EXIF rotation, size caps, and the SSRF guard that refuses URLs resolving to private addresses |
-| `tests/test_runner.py` | Job lifecycle: queueing, cancellation, eviction, progress and ETA, thread-safe snapshots, and whole runs in both single and tiled mode |
-| `tests/test_api.py` | Every HTTP endpoint, including uploads, validation errors, the SSE progress stream and downloading a finished run |
-| `tests/test_entrypoints.py` | Every script still imports, and none of them start work at import time |
-
-Useful variations:
+| `tests/test_evolve_voronoi.py` | Palette condensing, region detection, region-seeded initialization (including that it beats uniform random), parent pickers, and a short real evolution that must improve fitness |
+| `tests/test_evolve_tiled.py` | Tile grids cover the image exactly once, feather masks stay opaque over tile cores, stitching leaves no visible seam |
+| `tests/test_params.py` | Every hyperparameter bound, the outline-color parser, and the phase and survivor arithmetic the progress bar depends on |
+| `tests/test_imaging.py` | Decoding, EXIF rotation, size caps, and the SSRF guard |
+| `tests/test_runner.py` | Job lifecycle: queueing, cancellation, eviction, progress and ETA, whole runs in single and tiled mode |
+| `tests/test_api.py` | Every HTTP endpoint, including uploads, validation errors, the SSE stream and downloading a finished run |
+| `tests/test_entrypoints.py` | Every script still imports, and none starts work at import time |
 
 ```bash
 pytest -m "not slow"                     # skip the real-evolution tests
-pytest tests/test_api.py -k upload       # one file, one pattern
 pytest --cov --cov-report=term-missing   # coverage report
 python scripts/run_tests.py --fast       # same thing, platform independent
 ```
 
-Tests that run a real evolution loop are marked `slow`.
-
-### Continuous integration
-
 [`.github/workflows/tests.yml`](.github/workflows/tests.yml) runs the suite on
-every push and pull request, nightly at 06:17 UTC, and on demand - across
-**Linux, Windows and macOS on Python 3.12 and 3.14**. Test results and coverage
-are uploaded as artifacts, and the `all tests passed` job is the one to mark as
-a required status check on the default branch.
-
-Locally, install the git hooks once and the suite runs before every push:
-
-```bash
-python scripts/install_hooks.py
-```
-
-`git push --no-verify` skips it for one push, and
-`python scripts/install_hooks.py --uninstall` removes it.
+every push and pull request, nightly, and on demand, across **Linux, Windows and
+macOS on Python 3.12 and 3.14**. Locally, `python scripts/install_hooks.py`
+installs a pre-push hook that runs the suite before every push
+(`git push --no-verify` skips it once, and `--uninstall` removes it).
 
 ---
 
-## Setup
+## Getting started
 
-Requirements: Python 3.12 or later (CI covers 3.12 and 3.14; the pinned NumPy
-and scikit-image releases do not support anything older than 3.11), Git 2.0 or
-later, on Windows, macOS or Linux.
+Requires Python 3.12 or later (CI covers 3.12 and 3.14) and Git, on Windows,
+macOS or Linux.
 
 ```bash
-git clone https://github.com/TheElliotGong/Genetic-Art-Algorithm-part-2
-cd Genetic-Art-Algorithm-part-2
+git clone https://github.com/TheElliotGong/Stained-Glass-Genetic-Algorithm
+cd Stained-Glass-Genetic-Algorithm
 python -m venv venv
 ```
 
-Activate it - on Windows PowerShell:
+Activate the environment. On Windows PowerShell:
 
 ```powershell
 .\venv\Scripts\Activate.ps1
@@ -300,85 +390,32 @@ On macOS or Linux:
 source venv/bin/activate
 ```
 
-Then install dependencies:
+Then install and run:
 
 ```bash
 pip install -r requirements.txt      # runtime
 pip install -r requirements-dev.txt  # plus everything the tests need
+python run_web.py                    # open http://127.0.0.1:8000
 ```
 
 ---
 
-## Command line usage
+## What was deliberately left alone
 
-```bash
-python evolve_tiled.py    # divide-and-conquer tiled approach. Recommended.
-python evolve_voronoi.py  # whole-image brute force approach.
-```
-
-The target image path and output directory are set in the main routine:
-
-```python
-target_image_path = "./img/girl_with_pearl_earring_half.jpg"
-checkpoint_path = "./output/"
-```
-
-### `evolve_voronoi.py` (whole-image)
-
-- `num_points`: Voronoi points per painting, controlling detail. Default `250`.
-- `population_size`: GA population size. Default `250`.
-- `initialColorCount`: colors extracted for the initial palette. Default `60`.
-- `finalColorCount`: colors kept after condensing. Default `20`.
-- `concurrent_workers`: worker processes for parallel evaluation. Default `4`.
-- Operators and schedule: `survive fraction` (e.g. `0.025`), `mutation rate`
-  (typically `0.03`-`0.05`, sigma `0.4`-`0.5`), and `breed` / `combiner` using
-  the `mate` and `merge` functions.
-
-### `evolve_tiled.py` (divide and conquer)
-
-- `n_rows`, `n_cols`: tile grid size. Defaults `3, 3`.
-- `points_initial`: points seeded per tile. Default `50`.
-- `population_size`: population per tile. Default `100`.
-- `workers`: concurrent workers per tile. Default `4`; the example run uses `8`.
-- `gens_phase1`, `gens_phase2`: generations for the two phases. Defaults `999`
-  and `1000`.
-- `initial_color_count` / `final_color_count`: per-tile palette. Defaults `30`
-  and `12`.
-- `region_bias`: probability of seeding inside a detected region. Example `0.85`.
-- `min_area`: minimum pixel area for detected regions. Example `10` for tiles.
-- Operators: `survive fraction` `0.025`, mutation rate `0.03`-`0.05` (sigma
-  `0.4`-`0.5`), plus a dedicated merge/duplication stage that increases the
-  point count mid-run.
-
-Prefer the tiled workflow for large images - lower memory use and easier
-parallelism.
-
----
-
-## Environment variables
-
-- `VORONOI_PROGRESS=1`: restore the per-evaluation progress dots (off by
-  default; they cost a flushed write per individual per generation).
-- `VORONOI_TARGET_CACHE=<dir>`: where target pixels are spooled so that worker
-  processes started with `spawn` (the default on Windows) can load them.
-  Defaults to a `voronoi-targets` folder in the system temp directory.
-- `VORONOI_EMBED_TARGET=1`: skip the spool file and embed target pixels in every
-  serialized painting. Slower, but makes population checkpoints self-contained
-  and loadable on another machine.
-- `VORONOI_WEB_DATA=<dir>`: where the web interface stores uploads and run
-  output. Defaults to `runs/` next to the code.
-- `VORONOI_ALLOW_PRIVATE_URLS=1`: allow "from URL" fetches that resolve to
-  private, loopback or link-local addresses. Blocked by default, because the
-  server fetches whatever URL it is handed - only enable it if you trust
-  everyone who can reach the app.
+The fitness function (L1 distance over RGB) and the evolutionary schedule are
+unchanged, so results stay comparable with the original and with each other.
+Changes that would alter early-generation results, such as scoring against a
+downscaled proxy image or retuning the schedule, are candidates for a separate,
+opt-in pass rather than part of the behavior-preserving work above.
 
 ---
 
 ## Credits
 
-Forked from Sebastian Proost's Voronoi-based genetic art algorithm, then
-extended with image pre-processing, cell outlining, the tiled solver, the
-performance work, the web application and the test suite.
+Forked from Sebastian Proost's
+[Voronoi-based genetic art algorithm](https://github.com/4dcu-be/Genetic-Art-Algorithm-part-2),
+then extended with the faster renderer, image pre-processing, cell outlining,
+the tiled solver, the performance work, the web application and the test suite.
 
 Contributors: Elliot Gong, Cesar Ramirez, Md Islam, Alex Alcazar.
 
